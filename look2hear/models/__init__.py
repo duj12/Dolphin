@@ -1,1 +1,1 @@
-from .dolphin import Dolphin
+from .dolphin import Dolphin, VideoEncoder

@@ -8,6 +8,12 @@ audionet:
     vmid_channels: 512
     vin_channels: 64
     vout_channels: 64
+    is_train: true
+    video_encoder_pretrained_hf:
+        model_id: "JusperLee/Dolphin"
+        revision: "main"
+        filename: "model.safetensors"
+        strict: false
 
     module_audio_enc:
         in_channels: 1
@@ -101,4 +107,79 @@ audionet:
         codebook_dim: 64
         commitment_cost: 1.0
         distill_cost: 1.0
+
+# Loss config
+loss:
+  train:
+    loss_func: MultiDecoder_PITLossWrapper
+    sdr_type: MultistageLoss
+    stftconfig:
+      frame_length: 512
+      frame_shift: 128
+      window: "hann"
+      num_stages: 4
+      scale_inv: false
+      mel_opt: false
+    config:
+      pit_from: pw_mtx
+      threshold_byloss: false
+  val:
+    loss_func: PITLossWrapper
+    sdr_type: pairwise_neg_sisdr
+    config:
+      pit_from: pw_mtx
+      threshold_byloss: false
+
+# Training config
+training:
+  system: AudioVisualLightningModuleAE
+  gpus: [1]
+  parallel: ddp
+  epochs: 500
+  gradient_clip_val: 5.0
+  sync_batchnorm: true
+  early_stop:
+    monitor: val_loss/dataloader_idx_0
+    mode: min
+    patience: 20
+    verbose: true
+
+# Optimizer config
+optimizer:
+  optim_name: adam
+  lr: 0.002
+  weight_decay: 0.0
+
+# Scheduler config
+scheduler:
+  sche_name: ReduceLROnPlateau
+  sche_config:
+    patience: 10
+    factor: 0.5
+
+# Data config
+datamodule:
+  data_name: AVSpeechDataModule
+  data_config:
+    train_dir: DataPreProcess/LRS2/tr
+    valid_dir: DataPreProcess/LRS2/cv
+    test_dir: DataPreProcess/LRS2/tt
+    n_src: 1
+    sample_rate: 16000
+    segment: 2.0
+    normalize_audio: false
+    batch_size: 4
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: false
+
+exp:
+  exp_name: LRS2-final-Dolphin-1gpu-batch4
+
+logging:
+  use_swanlab: true
+  swanlab:
+    project: "test-dolpin"
+    workspace: "jusperlee"
+    offline: false
 

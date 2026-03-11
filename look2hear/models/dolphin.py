@@ -10,8 +10,10 @@ References:
 
 """
 
+import os
 from re import S
 import torch
+import json
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,6 +21,8 @@ import math
 from vector_quantize_pytorch import ResidualVQ
 from .video_compoent import * 
 from huggingface_hub import PyTorchModelHubMixin
+
+from huggingface_hub import hf_hub_download
 
 class LayerScale(torch.nn.Module):
     def __init__(self, dims, input_size, Layer_scale_init=1.0e-5):
@@ -928,11 +932,14 @@ class ReconstructionPath(nn.Module):
     ):
         super().__init__()
         input_conv_kernel_size=tuple(input_conv_kernel_size)
+        output_conv_kernel_size=tuple(output_conv_kernel_size)
 
         self.conv_in = nn.Conv3d(in_channel, init_channel, input_conv_kernel_size,padding='same')
+        self.conv_out = nn.Conv3d(init_channel, in_channel, output_conv_kernel_size, padding='same')
 
         layer_fmap_size=image_size
         self.encoder_layers = nn.ModuleList([]) 
+        self.decoder_layers = nn.ModuleList([])
         dim=init_channel
         dim_out=dim
         time_downsample_factor=1
@@ -940,16 +947,19 @@ class ReconstructionPath(nn.Module):
         for layer_type in layers:
             if layer_type == 'residual':
                 encoder_layer = ResidualUnit(dim, residual_conv_kernel_size)
+                decoder_layer = ResidualUnit(dim, residual_conv_kernel_size)
 
             elif layer_type == 'consecutive_residual':
                 num_consecutive = 2
                 encoder_layer = Sequential(*[ResidualUnit(dim, residual_conv_kernel_size) for _ in range(num_consecutive)])
+                decoder_layer = Sequential(*[ResidualUnit(dim, residual_conv_kernel_size) for _ in range(num_consecutive)])
 
             elif layer_type == 'compress_space':
                 dim_out = dim * 2
                 dim_out = min(dim_out, max_dim)
 
                 encoder_layer = SpatialDownsample2x(dim, dim_out)
+                decoder_layer = SpatialUpsample2x(dim_out, dim)
 
                 assert layer_fmap_size > 1
                 layer_fmap_size //= 2
@@ -959,6 +969,7 @@ class ReconstructionPath(nn.Module):
                 dim_out = min(dim_out, max_dim)
 
                 encoder_layer = TimeDownsample2x(dim, dim_out)
+                decoder_layer = TimeUpsample2x(dim_out, dim)
 
                 time_downsample_factor *= 2
 
@@ -975,6 +986,10 @@ class ReconstructionPath(nn.Module):
                     Residual(SpaceAttention(**attn_kwargs)),
                     Residual(FeedForward(dim))
                 )
+                decoder_layer = Sequential(
+                    Residual(SpaceAttention(**attn_kwargs)),
+                    Residual(FeedForward(dim))
+                )
 
             elif layer_type == 'linear_attend_space':
                 linear_attn_kwargs = dict(
@@ -987,11 +1002,16 @@ class ReconstructionPath(nn.Module):
                     Residual(LinearSpaceAttention(**linear_attn_kwargs)),
                     Residual(FeedForward(dim))
                 )
+                decoder_layer = Sequential(
+                    Residual(LinearSpaceAttention(**linear_attn_kwargs)),
+                    Residual(FeedForward(dim))
+                )
 
             else:
                 raise ValueError(f'unknown layer type {layer_type}')
 
             self.encoder_layers.append(encoder_layer)
+            self.decoder_layers.insert(0, decoder_layer)
 
             dim = dim_out
         
@@ -1000,7 +1020,6 @@ class ReconstructionPath(nn.Module):
             nn.LayerNorm(dim),
             Rearrange('b ... c -> b c ...'),
         ))
-
 
     def forward(self, x, semantic_fea=None):
         x = self.conv_in(x)
@@ -1017,6 +1036,27 @@ class ReconstructionPath(nn.Module):
             z_q=z_q + semantic_fea
         
         return z_q
+
+    def reconstruct(self, x, semantic_fea=None):
+        x = self.conv_in(x)
+        for layer in self.encoder_layers:
+            x = layer(x)
+        z_e = x
+
+        z_q = z_e
+        if semantic_fea is not None:
+            B, C, T, H, W = z_q.shape
+            z_q = z_q.contiguous().permute(0, 2, 1, 3, 4)
+            z_q = z_q.contiguous().view(B, T, -1)
+            z_q = z_q + semantic_fea
+            z_q = z_q.contiguous().view(B, T, C, H, W)
+            z_q = z_q.contiguous().permute(0, 2, 1, 3, 4)
+
+        for layer in self.decoder_layers:
+            z_q = layer(z_q)
+
+        x_hat = self.conv_out(z_q)
+        return x_hat
 
 class SemanticPath(nn.Module):
     def __init__(
@@ -1136,6 +1176,8 @@ class SemanticPath(nn.Module):
             kmeans_iters = 10 
         )
 
+        self.distill_out = nn.Linear(dim * layer_fmap_size * layer_fmap_size, distill_dim)
+
     def forward(self, x):
         x = self.conv_in(x)
         for layer in self.encoder_layers:
@@ -1144,8 +1186,10 @@ class SemanticPath(nn.Module):
         x = x.contiguous().permute(0,2,1,3,4)
         z_e = x.contiguous().view(b,t,-1)
 
-        z_q,_,_=self.quantizer(z_e)
+        z_q, _, commitment_loss = self.quantizer(z_e)
 
+        if self.training:
+            return z_q, self.distill_out(z_q), commitment_loss.sum(dim=1)
         return z_q
 
 class VideoEncoder(nn.Module):
@@ -1218,8 +1262,24 @@ class VideoEncoder(nn.Module):
         )
 
     def forward(self, x):
-        semantic_fea = self.semantic_model(x)
-        return self.recon_model(x,semantic_fea)
+        semantic_out = self.semantic_model(x)
+        if isinstance(semantic_out, (tuple, list)):
+            semantic_fea, distill_out, commitment_loss = semantic_out
+            x_hat = self.recon_model.reconstruct(x, semantic_fea)
+            return x_hat, distill_out, commitment_loss
+
+        semantic_fea = semantic_out
+        return self.recon_model(x, semantic_fea)
+
+    def reconstruct(self, x):
+        semantic_out = self.semantic_model(x)
+        if isinstance(semantic_out, (tuple, list)):
+            semantic_fea, distill_out, commitment_loss = semantic_out
+            x_hat = self.recon_model.reconstruct(x, semantic_fea)
+            return x_hat, distill_out, commitment_loss
+
+        semantic_fea = semantic_out
+        return self.recon_model.reconstruct(x, semantic_fea)
     
 class Dolphin(nn.Module, PyTorchModelHubMixin):
     def __init__(self, 
@@ -1234,7 +1294,9 @@ class Dolphin(nn.Module, PyTorchModelHubMixin):
                  vpre_channels=512,
                  vmid_channels=512,
                  vin_channels=64,
-                 vout_channels=64,):
+                 vout_channels=64,
+                 is_train: bool = False,
+                 video_encoder_pretrained_hf: dict = None,):
         super(Dolphin, self).__init__()
 
         self.pre_v1 = ConvNormAct(vpre_channels, vin_channels, kSize=3, norm_type="BN")
@@ -1250,6 +1312,138 @@ class Dolphin(nn.Module, PyTorchModelHubMixin):
         self.modalfuse = AVFModule(module_feature_projector["out_channels"], vout_channels)
     
         self.video_encoder = VideoEncoder(**video_encoder_params)
+        self.is_train = is_train
+
+        if self.is_train:
+            self._load_video_encoder_from_hub(video_encoder_pretrained_hf)
+            self._freeze_video_encoder()
+
+    def _freeze_video_encoder(self):
+        for param in self.video_encoder.parameters():
+            param.requires_grad = False
+        self.video_encoder.eval()
+        total_params = sum(p.numel() for p in self.video_encoder.parameters())
+        trainable_params = sum(p.numel() for p in self.video_encoder.parameters() if p.requires_grad)
+        print(
+            "[Dolphin] video_encoder frozen: "
+            f"total_params={total_params}, trainable_params={trainable_params}"
+        )
+
+    def _extract_state_dict(self, checkpoint):
+        if isinstance(checkpoint, dict):
+            if "state_dict" in checkpoint:
+                return checkpoint["state_dict"]
+            if "model_state_dict" in checkpoint:
+                return checkpoint["model_state_dict"]
+        return checkpoint
+
+    def _load_video_encoder_from_hub(self, pretrained_cfg: dict):
+        if pretrained_cfg is None:
+            pretrained_cfg = {}
+
+        source = pretrained_cfg.get("source", "huggingface")
+        strict = pretrained_cfg.get("strict", False)
+
+        if source in {"huggingface", "hf", "hub"}:
+            model_id = pretrained_cfg.get("model_id", "")
+            if not model_id:
+                raise ValueError(
+                    "When is_train=True and source='huggingface', "
+                    "video_encoder_pretrained_hf.model_id must be provided."
+                )
+
+            revision = pretrained_cfg.get("revision", "main")
+            filename = pretrained_cfg.get("filename", "model.safetensors")
+            cache_dir = pretrained_cfg.get("cache_dir", None)
+            force_download = pretrained_cfg.get("force_download", False)
+            proxies = pretrained_cfg.get("proxies", None)
+            resume_download = pretrained_cfg.get("resume_download", False)
+            local_files_only = pretrained_cfg.get("local_files_only", False)
+            token = pretrained_cfg.get("token", None)
+
+            model_file = hf_hub_download(
+                repo_id=model_id,
+                filename=filename,
+                revision=revision,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                proxies=proxies,
+                resume_download=resume_download,
+                local_files_only=local_files_only,
+                token=token,
+            )
+        elif source in {"local", "pth"}:
+            model_file = pretrained_cfg.get("path", pretrained_cfg.get("local_path", ""))
+            if not model_file:
+                raise ValueError(
+                    "When is_train=True and source='local', "
+                    "video_encoder_pretrained_hf.path (or local_path) must be provided."
+                )
+            if not os.path.isfile(model_file):
+                raise FileNotFoundError(f"Local checkpoint not found: {model_file}")
+        else:
+            raise ValueError(
+                f"Unsupported source '{source}'. Expected one of: "
+                "'huggingface', 'hf', 'hub', 'local', 'pth'."
+            )
+
+        if model_file.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            state_dict = load_file(model_file, device="cpu")
+        else:
+            checkpoint = torch.load(model_file, map_location="cpu", weights_only=False)
+            state_dict = self._extract_state_dict(checkpoint)
+
+        # 仅提取 video_encoder 参数加载，其他模块保持随机初始化参与训练。
+        video_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("video_encoder."):
+                video_state_dict[key[len("video_encoder."):]] = value
+            elif key.startswith("module.video_encoder."):
+                video_state_dict[key[len("module.video_encoder."):]] = value
+            else:
+                video_state_dict[key] = value
+
+        if len(video_state_dict) == 0:
+            raise RuntimeError(
+                f"No 'video_encoder.*' parameters were found in pretrained weights from '{model_file}'. "
+                "Please verify the checkpoint file."
+            )
+
+        incompatible = self.video_encoder.load_state_dict(video_state_dict, strict=strict)
+        loaded_tensors = len(video_state_dict)
+        print(
+            "[Dolphin] video_encoder loaded: "
+            f"source={model_file}, strict={strict}, tensors={loaded_tensors}"
+        )
+        filtered_missing_keys = incompatible.missing_keys
+        filtered_unexpected_keys = incompatible.unexpected_keys
+        if not strict:
+            ignored_prefixes = (
+                "recon_model.conv_out.",
+                "recon_model.decoder_layers.",
+            )
+            filtered_missing_keys = [
+                key for key in incompatible.missing_keys
+                if not key.startswith(ignored_prefixes)
+            ]
+            filtered_unexpected_keys = [
+                key for key in incompatible.unexpected_keys
+                if not key.startswith(ignored_prefixes)
+            ]
+
+        if (not strict) and (filtered_missing_keys or filtered_unexpected_keys):
+            print(
+                "[Dolphin] load video_encoder from hub (strict=False): "
+                f"missing_keys={filtered_missing_keys}, "
+                f"unexpected_keys={filtered_unexpected_keys}"
+            )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.is_train:
+            self.video_encoder.eval()
+        return self
     
     @classmethod
     def _from_pretrained(
@@ -1268,9 +1462,6 @@ class Dolphin(nn.Module, PyTorchModelHubMixin):
         **model_kwargs,
     ):
         """Load model from HuggingFace Hub with proper configuration handling."""
-        import json
-        from huggingface_hub import hf_hub_download
-        
         # Download config file
         config_file = hf_hub_download(
             repo_id=model_id,
@@ -1294,12 +1485,13 @@ class Dolphin(nn.Module, PyTorchModelHubMixin):
             "architectures", "auto_map"
         }
         model_config = {k: v for k, v in config.items() if k not in hf_metadata_keys}
+        model_config.update(model_kwargs)
+        model_config.setdefault("is_train", False)
         
         # Create model instance with config
         model = cls(**model_config)
         
         # Try to download different possible model file formats
-        import torch
         model_files_to_try = [
             "model.safetensors", 
         ]
@@ -1355,6 +1547,8 @@ class Dolphin(nn.Module, PyTorchModelHubMixin):
             raise RuntimeError(f"Could not load model weights from any of the tried files: {model_files_to_try}")
         
         model.load_state_dict(state_dict, strict=strict)
+        if model.is_train:
+            model._freeze_video_encoder()
         
         return model
         

@@ -1,0 +1,88 @@
+# Network config
+audionet:
+  audionet_name: VideoEncoder
+  audionet_config:
+    layers: [
+      'residual',
+      'compress_space',
+      'consecutive_residual',
+      'compress_space',
+      'consecutive_residual',
+      'linear_attend_space',
+      'compress_space',
+      'consecutive_residual',
+      'attend_space'
+    ]
+    image_size: 88
+    in_channel: 1
+    init_channel: 4
+    max_dim: 32
+    input_conv_kernel_size: [7, 7, 7]
+    output_conv_kernel_size: [3, 3, 3]
+    residual_conv_kernel_size: 3
+    pad_mode: "constant"
+    attn_dim_head: 32
+    attn_heads: 8
+    attn_dropout: 0.0
+    flash_attn: true
+    linear_attn_dim_head: 8
+    linear_attn_heads: 16
+    num_quantizers: 1
+    codebook_size: 256
+    codebook_dim: 64
+    commitment_cost: 1.0
+    distill_cost: 1.0
+
+# Optional AV-HuBERT target embeddings for distillation
+encoded_video:
+  encoded_video: videoencoder_pretrain/test_out/videodata_large_3datasets.pth
+
+# Training config
+training:
+  gpus: [0]
+  epochs: 500
+  gradient_clip_val: 5.0
+  sync_batchnorm: true
+  commitment_cost: 1.0
+  distill_cost: 1.0
+  early_stop:
+    monitor: val/loss
+    mode: min
+    patience: 20
+    verbose: true
+
+# Optimizer config
+optimizer:
+  optim_name: adam
+  lr: 0.0003
+  betas: [0.9, 0.999]
+  weight_decay: 0.00001
+
+# Scheduler config
+scheduler:
+  sche_name: ReduceLROnPlateau
+  sche_config:
+    patience: 5
+    factor: 0.5
+
+# Data config
+datamodule:
+  data_name: VideoPretrainDataModule
+  data_config:
+    train_dir: DataPreProcess/video_pretrain/train.txt
+    valid_dir: DataPreProcess/video_pretrain/val.txt
+    segment: 2.0
+    batch_size: 1
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: false
+
+exp:
+  exp_name: videoencoder-pretrain
+
+logging:
+  use_swanlab: true
+  swanlab:
+    project: "test-dolpin"
+    workspace: "jusperlee"
+    offline: false

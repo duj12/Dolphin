@@ -7,6 +7,13 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+DataPreProcess/LRS2
+DataPreProcess/video_pretrain
+DataPreProcess/videodata_3dataset.txt
+av_hubert
+Experiments
+videoencoder_pretrain/test_mouths
+videoencoder_pretrain/test_out
 node_modules
 .DS_Store
 dist
@@ -31,3 +38,16 @@ yarn.lock
 tmp/*
 .gradio
 *.pyc
+
+*.pt
+*.npy
+*.npz
+*.pth
+*.pt.gz
+*.pt.tar
+*.pt.tar.gz
+*.pt.tar.bz2
+*.pt.tar.xz
+*.pt.tar.lzma
+*.pt.tar.lz
+*.pt.tar.lz4

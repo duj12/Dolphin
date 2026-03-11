@@ -11,8 +11,8 @@
   <img src="https://visitor-badge.laobi.icu/badge?page_id=JusperLee.Dolphin" alt="访客统计" />
   <img src="https://img.shields.io/github/stars/JusperLee/Dolphin?style=social" alt="GitHub stars" />
   <img alt="Static Badge" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" />
-  <a href="https://arxiv.org/abs/2509.23610" target="_blank" rel="noreferrer noopener">
-    <img alt="arXiv Paper" src="https://img.shields.io/badge/arXiv-2509.23610-b31b1b.svg?logo=arxiv&logoColor=white" />
+  <a href="https://openreview.net/forum?id=LaIkPfPu9K" target="_blank" rel="noreferrer noopener">
+    <img alt="ICLR 2026 OpenReview" src="https://img.shields.io/badge/ICLR%202026-OpenReview-8c1b13.svg?logo=openreview&logoColor=white" />
   </a>
   <a href="https://huggingface.co/JusperLee/Dolphin" target="_blank" rel="noreferrer noopener">
     <img alt="Hugging Face Models" src="https://img.shields.io/badge/Hugging%20Face-Models-ff9d2c?logo=huggingface&logoColor=white" />
@@ -38,6 +38,8 @@
 
 ## 💥 News
 
+- **[2026-03-10]** Added video encoder pretraining and audio training code, together with updated training instructions in README. 🚀
+- **[2026-01-26]** Dolphin was accepted to ICLR 2026. 🎉
 - **[2025-09-28]** Code and pre-trained models are released! 📦
 
 ## 📜 Abstract
@@ -137,9 +139,7 @@ pip install -r requirements.txt
 - CUDA >= 12.4
 - Other dependencies in requirements.txt
 
-## 🚀 Quick Start
-
-### Inference with Pre-trained Model
+## 🔍 Inference with Pre-trained Model
 
 ```python
 # Single audio-visual separation
@@ -159,19 +159,156 @@ python inference.py \
 |-------|--------------|---------|------|----------|
 | Dolphin | VoxCeleb2 | 16.1 dB | 3.45 | [Link](https://huggingface.co/JusperLee/Dolphin) |
 
+## 🚀 Training Pipeline
+
+### Step 1. Video Encoder Pretraining (Placeholder)
+
+1) You can first prepare the video-only file list:
+
+```bash
+python DataPreProcess/process_videoonly.py \
+  --in_dirs /path/to/lrs2/mouths /path/to/lrs3/mouths /path/to/vox2/mouths \
+  --out_dir DataPreProcess/video_pretrain.txt
+
+python DataPreProcess/split_dataset.py \
+  --input DataPreProcess/video_pretrain.txt \
+  --output_dir DataPreProcess/video_pretrain \
+  --train_ratio 0.8 \
+  --seed 42
+
+```
+
+2) Install AV-HuBERT:
+
+```bash
+git clone https://github.com/facebookresearch/av_hubert.git
+cd av_hubert
+git submodule init
+git submodule update
+```
+
+Lastly, install Fairseq and the other packages:
+
+```bash
+pip install -r requirements.txt
+cd fairseq
+pip install --editable ./
+```
+
+3) Extract AV-HuBERT mouth features:
+
+```bash
+cd ../../
+wget -O videoencoder_pretrain/large_vox_433h.pt \
+  https://dl.fbaipublicfiles.com/avhubert/model/lrs3_vox/vsr/large_vox_433h.pt
+
+torchrun --nproc_per_node=8 videoencoder_pretrain/extract_avhubert_mouth_features.py \
+  --in_dirs /path/to/lrs2/mouths /path/to/lrs3/mouths /path/to/vox2/mouths \
+  --ckpt_path videoencoder_pretrain/large_vox_433h.pt \
+  --output_dir videoencoder_pretrain \
+  --output_prefix videodata_3dataset \
+  --merged_output_name videodata_large_3datasets.pth
+```
+
+4) Pretrain the video encoder:
+```bash
+python videoencoder_pretrain/pretrain.py --conf_dir=configs/videoencoder_pretrain.yml
+```
+
+### Step 2. Separator Training (after video encoder pretraining)
+
+> ❗ Reminder: You can skip Step 1 and directly use the provided pretrained video encoder for separator training. However, if you are using a third-party dataset other than LRS2, LRS3, or Vox2, we recommend rerunning Step 1 to pretrain the video encoder on your own data.
+
+1) Prepare your dataset JSONs (e.g., `mix.json`, `s1.json`, `s2.json`) under:
+
+```bash
+python DataPreProcess/process_lrs23.py \
+  --in_audio_dir lrs3_rebuild/audio/wav16k/min \
+  --in_mouth_dir lrs3_rebuild/mouths \
+  --out_dir DataPreProcess/LRS3
+
+python DataPreProcess/process_vox2.py \
+  --in_audio_dir vox2/audio_10w/wav16k/min \
+  --in_mouth_dir vox2/mouths \
+  --out_dir DataPreProcess/vox2
+```
+
+2) Check key fields in `configs/dolphin.yml`:
+- Basic training fields:
+```yaml
+datamodule:
+  data_name: AVSpeechDataModule
+
+audionet:
+  audionet_name: Dolphin
+  audionet_config:
+    is_train: true
+
+training:
+  system: AudioVisualLightningModuleAE
+
+loss:
+  train:
+    loss_func: MultiDecoder_PITLossWrapper
+```
+- Configure video encoder weights:
+  Keep the following if you load from Hugging Face:
+```yaml
+audionet:
+  audionet_config:
+    video_encoder_pretrained_hf:
+      source: "huggingface"
+      model_id: "JusperLee/Dolphin"
+      revision: "main"
+      filename: "model.safetensors"
+      strict: false
+```
+  Change it to the following if you use a local checkpoint such as `Experiments/checkpoint/videoencoder-pretrain/best_model.pth`:
+```yaml
+audionet:
+  audionet_config:
+    video_encoder_pretrained_hf:
+      source: "local"
+      path: "Experiments/checkpoint/videoencoder-pretrain/best_model.pth"
+      strict: false
+```
+  `source` supports `huggingface` / `hf` / `hub` and `local` / `pth`.
+  `path` can be either a relative path from the project root or an absolute path.
+  The local checkpoint must contain `video_encoder.*` weights.
+- Configure experiment logging if needed:
+```yaml
+logging:
+  use_swanlab: true
+  swanlab:
+    project: "test-dolphin"
+    workspace: "your_swanlab_workspace"
+    offline: false
+```
+  `logging.use_swanlab: true` enables SwanLab; if set to `false`, training falls back to TensorBoard automatically.
+  `logging.swanlab.project` is the project name shown in SwanLab.
+  `logging.swanlab.workspace` is your SwanLab workspace or username.
+  `logging.swanlab.offline: true` means offline logging only; `false` means upload online.
+
+3) Start training:
+```bash
+python train.py --conf_dir=configs/dolphin.yml
+```
+
+During startup, you should see logs like:
+- `[Dolphin] video_encoder loaded: ...`
+- `[Dolphin] video_encoder frozen: ... trainable_params=0`
+
+
 ## 📖 Citation
 
 If you find Dolphin useful in your research, please cite:
 
 ```bibtex
-@misc{li2025efficientaudiovisualspeechseparation,
-      title={Efficient Audio-Visual Speech Separation with Discrete Lip Semantics and Multi-Scale Global-Local Attention}, 
+@inproceedings{li2026efficientaudiovisualspeechseparation,
+      title={Efficient Audio-Visual Speech Separation with Discrete Lip Semantics and Multi-Scale Global-Local Attention},
       author={Kai Li and Kejun Gao and Xiaolin Hu},
-      year={2025},
-      eprint={2509.23610},
-      archivePrefix={arXiv},
-      primaryClass={cs.SD},
-      url={https://arxiv.org/abs/2509.23610}, 
+      booktitle={International Conference on Learning Representations (ICLR)},
+      year={2026}
 }
 ```
 
