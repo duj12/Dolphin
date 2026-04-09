@@ -23,7 +23,7 @@ from Inference import (
 
 def detectface_with_status(video_input_path, output_path, detect_every_N_frame, scalar_face_detection, number_of_speakers, status_callback=None):
     """Face detection with status updates"""
-    device = torch.device('cuda' if torch.cuda.get_device_name() else 'cpu')
+    device = torch.device('cpu')
     if status_callback:
         status_callback({'status': f'Running on device: {device}', 'progress': 0.0})
     
@@ -49,7 +49,7 @@ def detectface_with_status(video_input_path, output_path, detect_every_N_frame, 
         status_callback({'status': f'Processing {total_frames} frames', 'progress': 0.1})
     
     video_clip.close()
-    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
+    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, device="cpu", flip_input=False)
     
     for i, frame in enumerate(frames):
         if status_callback and i % 10 == 0:

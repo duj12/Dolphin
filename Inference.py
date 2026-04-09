@@ -292,7 +292,19 @@ def crop_patch(mean_face_landmarks, video_pathname, landmarks, window_margin, st
         try:
             frame = frame_gen.__next__() ## -- BGR
         except StopIteration:
-            break
+            # Video ended before all landmarks were consumed — flush remaining queue
+            if sequence is not None and q_frame:
+                while q_frame:
+                    cur_frame = q_frame.popleft()
+                    trans_frame = apply_transform(trans, cur_frame, STD_SIZE)
+                    trans_landmarks = trans(q_landmarks.popleft())
+                    sequence.append(cut_patch(trans_frame,
+                                             trans_landmarks[start_idx:stop_idx],
+                                             crop_height//2,
+                                             crop_width//2,))
+            if sequence is not None and len(sequence) > 0:
+                return np.array(sequence)
+            return None
         if frame_idx == 0:
             q_frame, q_landmarks = deque(), deque()
             sequence = []

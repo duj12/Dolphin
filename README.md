@@ -38,6 +38,7 @@
 
 ## 💥 News
 
+- **[2026-04-09]** Fixed quadratic memory scaling of Heat1D with respect to sequence length — now reduced to O(n log n). Thanks to @Shuhan Zhang, and @Wenxuan Wu for reporting this issue! 🔧
 - **[2026-03-10]** Added video encoder pretraining and audio training code, together with updated training instructions in README. 🚀
 - **[2026-01-26]** Dolphin was accepted to ICLR 2026. 🎉
 - **[2025-09-28]** Code and pre-trained models are released! 📦

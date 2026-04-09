@@ -20,7 +20,7 @@ dist
 dist-ssr
 coverage
 *.local
-
+*.claude
 /cypress/videos/
 /cypress/screenshots/
 
