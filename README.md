@@ -299,6 +299,25 @@ During startup, you should see logs like:
 - `[Dolphin] video_encoder loaded: ...`
 - `[Dolphin] video_encoder frozen: ... trainable_params=0`
 
+### Step 3. Evaluation
+
+After training completes, run evaluation on the test set:
+
+```bash
+python eval.py --conf_dir=Experiments/checkpoint/<exp_name>/conf.yml
+```
+
+For example:
+```bash
+python eval.py --conf_dir=Experiments/checkpoint/LRS2-final-Dolphin-1gpu-batch4/conf.yml
+```
+
+The script will:
+- Load `best_model.pth` from the experiment directory
+- Run inference on the full test set
+- Compute SI-SNR, SI-SNRi, SDR, SDRi, PESQ, and STOI
+- Save per-utterance results to `results/metrics.csv`
+- Save separated audio files under `results/wavs/`
 
 ## 📖 Citation
 
