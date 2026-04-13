@@ -158,7 +158,7 @@ python inference.py \
 
 | Model | Training Data | SI-SNRi | PESQ | Download |
 |-------|--------------|---------|------|----------|
-| Dolphin | VoxCeleb2 | 16.1 dB | 3.45 | [Link](https://huggingface.co/JusperLee/Dolphin) |
+| Dolphin | VoxCeleb2 | 14.6 dB | 3.17 | [Link](https://huggingface.co/JusperLee/Dolphin) |
 
 ## 🚀 Training Pipeline
 
