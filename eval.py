@@ -6,6 +6,7 @@
 ###
 
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "8"
 import argparse
 import warnings
 
@@ -27,6 +28,24 @@ from rich.progress import (
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
+from rich.text import Text
+
+
+class MetricsColumn(TextColumn):
+    """A progress column that displays live evaluation metrics."""
+
+    def __init__(self):
+        super().__init__("")
+        self._metrics = {}
+
+    def update(self, metrics: dict):
+        self._metrics = metrics
+
+    def render(self, task) -> Text:
+        if not self._metrics:
+            return Text("")
+        parts = [f"{k}: {v:.2f}" for k, v in self._metrics.items()]
+        return Text(" | ".join(parts), style="cyan")
 
 
 def main(config):
@@ -37,7 +56,6 @@ def main(config):
         "checkpoint",
         config["exp"]["exp_name"],
     )
-    model_path = os.path.join(exp_dir, "best_model.pth")
     results_dir = os.path.join(exp_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
 
@@ -46,22 +64,32 @@ def main(config):
 
     # ---- model ----
     audionet_name = config["audionet"]["audionet_name"]
-    audionet_cfg = dict(config["audionet"]["audionet_config"])
-    audionet_cfg["is_train"] = False
 
-    checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-    if "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    elif "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
+    if config.get("use_hf_model", False):
+        hf_model_id = config["hf_model_id"]
+        print(f"Loading model from HuggingFace Hub: {hf_model_id}")
+        model = getattr(look2hear.models, audionet_name).from_pretrained(
+            hf_model_id, strict=False,
+        )
     else:
-        state_dict = checkpoint
+        model_path = os.path.join(exp_dir, "best_model.pth")
+        audionet_cfg = dict(config["audionet"]["audionet_config"])
+        audionet_cfg["is_train"] = False
 
-    model = getattr(look2hear.models, audionet_name)(
-        sample_rate=config["datamodule"]["data_config"]["sample_rate"],
-        **audionet_cfg,
-    )
-    model.load_state_dict(state_dict, strict=False)
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+        if "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        elif "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
+
+        model = getattr(look2hear.models, audionet_name)(
+            sample_rate=config["datamodule"]["data_config"]["sample_rate"],
+            **audionet_cfg,
+        )
+        model.load_state_dict(state_dict, strict=False)
+
     model.to(device)
     model.eval()
 
@@ -78,6 +106,7 @@ def main(config):
     )
 
     # ---- progress bar ----
+    metrics_column = MetricsColumn()
     progress = Progress(
         TextColumn("[bold blue]Evaluating", justify="right"),
         BarColumn(bar_width=None),
@@ -86,6 +115,8 @@ def main(config):
         TransferSpeedColumn(),
         "•",
         TimeRemainingColumn(),
+        "•",
+        metrics_column,
     )
 
     # ---- evaluation loop ----
@@ -109,15 +140,6 @@ def main(config):
                     estimate=est_source,
                     key=key,
                 )
-
-                # save separated audio
-                save_dir = os.path.join(results_dir, "wavs")
-                os.makedirs(save_dir, exist_ok=True)
-                torchaudio.save(
-                    os.path.join(save_dir, key),
-                    est_source.cpu(),
-                    sample_rate,
-                )
             else:
                 mix, sources, mouths, key = test_set[idx]
                 mix = mix.to(device)
@@ -134,15 +156,8 @@ def main(config):
                     key=key,
                 )
 
-                # save separated audio per speaker
-                for spk_idx in range(est_sources.shape[0]):
-                    save_dir = os.path.join(results_dir, f"wavs/s{spk_idx + 1}")
-                    os.makedirs(save_dir, exist_ok=True)
-                    torchaudio.save(
-                        os.path.join(save_dir, key),
-                        est_sources[spk_idx : spk_idx + 1].cpu(),
-                        sample_rate,
-                    )
+            if idx % 50 == 0:
+                metrics_column.update(metrics.get_mean())
 
     metrics.final()
 
@@ -165,9 +180,31 @@ if __name__ == "__main__":
         default="Experiments/checkpoint/LRS2-final-Dolphin-1gpu-batch4/conf.yml",
         help="Path to the experiment config (conf.yml saved during training).",
     )
+    parser.add_argument(
+        "--use_hf",
+        action="store_true",
+        help="Load model from HuggingFace Hub instead of local checkpoint.",
+    )
+    parser.add_argument(
+        "--hf_model_id",
+        default="JusperLee/Dolphin",
+        help="HuggingFace model ID (default: JusperLee/Dolphin).",
+    )
+    parser.add_argument(
+        "--test_dir",
+        default=None,
+        help="Override test set directory from config.",
+    )
     args = parser.parse_args()
 
     with open(args.conf_dir, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    if args.use_hf:
+        config["use_hf_model"] = True
+        config["hf_model_id"] = args.hf_model_id
+
+    if args.test_dir:
+        config["datamodule"]["data_config"]["test_dir"] = args.test_dir
 
     main(config)

@@ -167,12 +167,14 @@ class Heat1D(nn.Module):
     A_n = C(a, n==0) * sum_{0}^{a} { \phi(x) cos(n π / a x) dx }
     core = cos(n π / a x) exp(- (n π / a)^2 k t)
     u_{x, t} = sum_{0}^{\infinite} { core }
-    
+
     Assume a = T; x in [0, T]; n in [0, T]; with some slight changes
     =>
     (\phi(x) = linear(dwconv(input(x))))
     A(n) = DCT1D(\phi(x))
     u(x, t) = IDCT1D(A(n) * exp(- (n π / a)^2 kt))
+
+    Uses FFT-based DCT/IDCT for O(T log T) memory instead of O(T²).
     """
     def __init__(self, dim=96, hidden_dim=96, **kwargs):
         super().__init__()
@@ -180,26 +182,58 @@ class Heat1D(nn.Module):
         self.hidden_dim = hidden_dim
         self.linear = nn.Conv1d(hidden_dim, 2 * hidden_dim, kernel_size=3, padding=1, groups=hidden_dim)
         self.out_norm = nn.LayerNorm(hidden_dim)
-        self.out_linear = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim) 
+        self.out_linear = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim)
         self.to_k = nn.Sequential(
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim),
             nn.GELU(),
         )
- 
+
         self.k = nn.Parameter(torch.ones(hidden_dim))
- 
+
     @staticmethod
-    def get_cos_map(N=224, device=torch.device("cpu"), dtype=torch.float):
-        # cos((x + 0.5) / N * n * π) which is also the form of DCT and IDCT
-        # DCT: F(n) = sum( (sqrt(2/N) if n > 0 else sqrt(1/N)) * cos((x + 0.5) / N * n * π) * f(x) )
-        # IDCT: f(x) = sum( (sqrt(2/N) if n > 0 else sqrt(1/N)) * cos((x + 0.5) / N * n * π) * F(n) )
-        # returns: (Res_n, Res_x)
-        weight_x = (torch.linspace(0, N - 1, N, device=device, dtype=dtype).view(1, -1) + 0.5) / N
-        weight_n = torch.linspace(0, N - 1, N, device=device, dtype=dtype).view(-1, 1)
-        weight = torch.cos(weight_n * weight_x * torch.pi) * math.sqrt(2 / N)
-        weight[0, :] = weight[0, :] / math.sqrt(2)
-        return weight
- 
+    def dct_1d(x):
+        """
+        Orthonormal DCT-II via FFT.  x: (..., N) -> (..., N)
+        Matches get_cos_map matrix: F(n) = sum_x sqrt(2/N) * cos((x+0.5)/N * n * pi) * f(x),
+        with n=0 scaled by 1/sqrt(2).
+        """
+        N = x.shape[-1]
+        # reorder: [x0, x2, x4, ..., x_{N-1(or N-2)}, ..., x3, x1]
+        v = torch.cat([x[..., ::2], x[..., 1::2].flip(dims=[-1])], dim=-1)
+        Vc = torch.fft.fft(v, dim=-1)
+        # phase shift: exp(-j * pi * k / (2N))
+        k = torch.arange(N, device=x.device, dtype=x.dtype)
+        phase = torch.exp(-1j * torch.pi * k / (2 * N))
+        # apply phase and take real part
+        X = (Vc * phase) .real * math.sqrt(2 / N)
+        # n=0 normalization: sqrt(1/N) instead of sqrt(2/N)
+        X[..., 0] = X[..., 0] / math.sqrt(2)
+        return X
+
+    @staticmethod
+    def idct_1d(X):
+        """
+        Orthonormal DCT-III (inverse DCT-II) via FFT.  X: (..., N) -> (..., N)
+        f(x) = sum_n sqrt(2/N) * cos((x+0.5)/N * n * pi) * F(n),
+        with n=0 scaled by 1/sqrt(2).
+        """
+        N = X.shape[-1]
+        # undo n=0 normalization
+        X_scaled = X.clone()
+        X_scaled[..., 0] = X_scaled[..., 0] * math.sqrt(2)
+        X_scaled = X_scaled * math.sqrt(2 / N)
+        # multiply by exp(j * pi * k / (2N)) * N/2  to prepare for IFFT
+        k = torch.arange(N, device=X.device, dtype=X.dtype)
+        phase = torch.exp(1j * torch.pi * k / (2 * N))
+        Vc = X_scaled * phase * (N / 2)
+        # inverse FFT
+        v = torch.fft.ifft(Vc, dim=-1).real
+        # unshuffle: reverse the reordering from DCT
+        x = torch.zeros_like(v)
+        x[..., ::2] = v[..., :((N + 1) // 2)]
+        x[..., 1::2] = v[..., ((N + 1) // 2):].flip(dims=[-1])
+        return x
+
     @staticmethod
     def get_decay_map(resolution=224, device=torch.device("cpu"), dtype=torch.float):
         # exp(- (n π / T)^2) for 1D
@@ -209,48 +243,45 @@ class Heat1D(nn.Module):
         weight = torch.pow(weight_n, 2)
         weight = torch.exp(-weight)
         return weight
- 
+
     def forward(self, x: torch.Tensor, freq_embed=None):
         B, T, C = x.shape
         x = x.transpose(1, 2)  # [B, T, C] -> [B, C, T]
         x = self.dwconv(x)  # [B, hidden_dim, T]
-        
+
         x = self.linear(x)  # [B, 2 * hidden_dim, T]
         x, z = x.chunk(chunks=2, dim=1)  # [B, hidden_dim, T], [B, hidden_dim, T]
- 
-        if (T == getattr(self, "__RES__", 0)) and (getattr(self, "__WEIGHT_COSN__", None).device == x.device):
-            weight_cosn = getattr(self, "__WEIGHT_COSN__", None)
+
+        # cache decay map only (no more [T,T] cosine matrix)
+        if (T == getattr(self, "__RES__", 0)) and (getattr(self, "__WEIGHT_EXP__", None).device == x.device):
             weight_exp = getattr(self, "__WEIGHT_EXP__", None)
-            assert weight_cosn is not None
             assert weight_exp is not None
         else:
-            weight_cosn = self.get_cos_map(T, device=x.device).detach_()
             weight_exp = self.get_decay_map(T, device=x.device).detach_()
             setattr(self, "__RES__", T)
-            setattr(self, "__WEIGHT_COSN__", weight_cosn)
             setattr(self, "__WEIGHT_EXP__", weight_exp)
- 
-        N = weight_cosn.shape[0]  # N == T
-        
+
+        # x: [B, hidden_dim, T] -> DCT along T dim
+        x = self.dct_1d(x)  # [B, hidden_dim, T]  (T == N in freq domain)
+
+        # exp decay in frequency domain
+        weight_exp = torch.pow(weight_exp[None, None, :], self.k[None, :, None])  # [1, hidden_dim, T]
+        x = x * weight_exp  # [B, hidden_dim, T]
+
+        # IDCT back to time domain
+        x = self.idct_1d(x)  # [B, hidden_dim, T]
+
         x = x.transpose(1, 2).contiguous()  # [B, T, hidden_dim]
-        
-        x = F.conv1d(x.contiguous().view(B, T, -1), weight_cosn.contiguous().view(N, T, 1))  # [B, N, hidden_dim]
-        
-        weight_exp = torch.pow(weight_exp[:, None], self.k)
-        x = torch.einsum("bnc,nc->bnc", x, weight_exp)  # exp decay
-        
-        x = F.conv1d(x.contiguous().view(B, N, -1), weight_cosn.t().contiguous().view(T, N, 1))  # [B, T, hidden_dim]
- 
         x = self.out_norm(x)  # [B, T, hidden_dim]
-        
+
         z = z.transpose(1, 2).contiguous()  # [B, T, hidden_dim]
         x = x * nn.functional.silu(z)  # [B, T, hidden_dim]
-        
+
         x = x.transpose(1, 2).contiguous()  # [B, hidden_dim, T]
         x = self.out_linear(x)  # [B, hidden_dim, T]
- 
+
         x = x.transpose(1, 2).contiguous()  # [B, T, hidden_dim]
- 
+
         return x
  
 class CLA(torch.nn.Module):

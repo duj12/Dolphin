@@ -38,7 +38,8 @@
 
 ## 💥 News
 
-- **[2026-04-09]** Fixed quadratic memory scaling of Heat1D with respect to sequence length — now reduced to O(n log n). Thanks to @Shuhan Zhang, and @Wenxuan Wu for reporting this issue! 🔧
+- **[2026-04-14]** Added HuggingFace Hub evaluation support in `eval.py` — load pretrained models directly with `--use_hf` flag. 🤗
+- **[2026-04-09]** Released `dolphin_light.py` — a memory-efficient variant that replaces the explicit cosine matrix in Heat1D with FFT-based DCT/IDCT, reducing memory from O(T²) to O(T log T) for long sequences.  Thanks to @Shuhan Zhang, and @Wenxuan Wu for reporting this issue! 🔧
 - **[2026-03-10]** Added video encoder pretraining and audio training code, together with updated training instructions in README. 🚀
 - **[2026-01-26]** Dolphin was accepted to ICLR 2026. 🎉
 - **[2025-09-28]** Code and pre-trained models are released! 📦
@@ -307,17 +308,24 @@ After training completes, run evaluation on the test set:
 python eval.py --conf_dir=Experiments/checkpoint/<exp_name>/conf.yml
 ```
 
-For example:
+You can also evaluate directly using the pretrained model from 🤗 HuggingFace Hub:
+
 ```bash
-python eval.py --conf_dir=Experiments/checkpoint/LRS2-final-Dolphin-1gpu-batch4/conf.yml
+python eval.py \
+  --conf_dir=configs/dolphin.yml \
+  --use_hf \
+  --hf_model_id JusperLee/Dolphin \
+  --test_dir /path/to/your/test/set
 ```
 
-The script will:
-- Load `best_model.pth` from the experiment directory
-- Run inference on the full test set
-- Compute SI-SNR, SI-SNRi, SDR, SDRi, PESQ, and STOI
-- Save per-utterance results to `results/metrics.csv`
-- Save separated audio files under `results/wavs/`
+| Argument | Description |
+|----------|-------------|
+| `--conf_dir` | Path to config YAML (training `conf.yml` or `configs/dolphin.yml`) |
+| `--use_hf` | Load model from HuggingFace Hub instead of local checkpoint |
+| `--hf_model_id` | HuggingFace model ID (default: `JusperLee/Dolphin`) |
+| `--test_dir` | Override test set directory from config |
+
+The script computes SI-SNR, SI-SNRi, SDR, SDRi, PESQ, and STOI, saves per-utterance results to `results/metrics.csv`, and displays live metrics every 50 samples in the progress bar.
 
 ## 📖 Citation
 
