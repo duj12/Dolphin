@@ -4,11 +4,13 @@
 # Email: lk21@mails.tsinghua.edu.cn
 # LastEditTime: 2022-10-04 16:00:58
 ###
+import random
 import torch
 import pytorch_lightning as pl
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from collections.abc import MutableMapping
 from .. import losses
+from ..utils.chunk_mask import sample_chunk_config
 
 
 def flatten_dict(d, parent_key="", sep="_"):
@@ -59,7 +61,11 @@ class AudioVisualLightningModuleAE(pl.LightningModule):
         # self.print(self.audio_model)
         self.validation_step_outputs = []
         self.test_step_outputs = []
-        
+
+        # Streaming/chunk-aware training config
+        self.streaming_config = self.config.get("streaming", {})
+        self.streaming_enabled = self.streaming_config.get("enabled", False)
+
         # print("device:",self.device)
         self.loss_func = {
             "train": getattr(losses, config["loss"]["train"]["loss_func"])(
@@ -72,8 +78,17 @@ class AudioVisualLightningModuleAE(pl.LightningModule):
             ),
         }
 
-    def forward(self, wav, mouth=None, key=None):
+    def forward(self, wav, mouth=None, key=None,
+                chunk_size=None, history_len=None, future_len=None):
         """Applies forward pass of the model.
+
+        Args:
+            wav: audio waveform
+            mouth: video mouth ROI
+            key: optional key
+            chunk_size: streaming chunk size in waveform samples (or None)
+            history_len: streaming history context in samples (or None)
+            future_len: streaming future lookahead in samples (or None)
 
         Returns:
             :class:`torch.Tensor`
@@ -83,12 +98,32 @@ class AudioVisualLightningModuleAE(pl.LightningModule):
             mouth = mouth.unsqueeze(1)
         if mouth is not None:
             mouth = mouth.to(dtype=wav.dtype)
-        return self.audio_model(wav, mouth)
+        return self.audio_model(wav, mouth,
+                                chunk_size=chunk_size,
+                                history_len=history_len,
+                                future_len=future_len)
 
     def training_step(self, batch, batch_nb):
         mixtures, targets, mouth, key = batch
 
-        model_out = self(mixtures, mouth, key)
+        # Sample streaming chunk params if enabled
+        chunk_size = None
+        history_len = None
+        future_len = None
+        if self.streaming_enabled and self._should_apply_chunk_mask():
+            chunk_cfg = sample_chunk_config(
+                self.streaming_config,
+                audio_encoder_stride=self.audio_model.audio_encoder_stride,
+                num_separator_stages=self.audio_model.separator.num_stages,
+            )
+            chunk_size = chunk_cfg.chunk_size
+            history_len = chunk_cfg.history_len
+            future_len = chunk_cfg.future_len
+
+        model_out = self(mixtures, mouth, key,
+                         chunk_size=chunk_size,
+                         history_len=history_len,
+                         future_len=future_len)
         if isinstance(model_out, (tuple, list)):
             est_sources, est_sources_bn = model_out[:2]
         else:
@@ -96,7 +131,7 @@ class AudioVisualLightningModuleAE(pl.LightningModule):
             est_sources_bn = model_out
         if targets.ndim == 2:
             targets = targets.unsqueeze(1)
-            
+
         loss = self.loss_func["train"](est_sources, est_sources_bn, targets, self.current_epoch)
 
         self.log(
@@ -187,6 +222,30 @@ class AudioVisualLightningModuleAE(pl.LightningModule):
             )
         self.validation_step_outputs.clear()  # free memory
         self.test_step_outputs.clear()  # free memory
+
+    def _should_apply_chunk_mask(self) -> bool:
+        """Decide whether to apply chunk masking for this training step.
+
+        Supports a gradual unmasking schedule:
+        - warmup_epochs: no masking (full context)
+        - ramp_epochs: gradually increase masking probability
+        - after ramp: always mask
+        """
+        schedule = self.streaming_config.get("schedule", {})
+        if not schedule.get("enabled", False):
+            return True
+
+        warmup = schedule.get("warmup_epochs", 10)
+        ramp = schedule.get("ramp_epochs", 20)
+        epoch = self.current_epoch
+
+        if epoch < warmup:
+            return False
+        elif epoch < warmup + ramp:
+            prob = (epoch - warmup) / ramp
+            return random.random() < prob
+        else:
+            return True
 
     def configure_optimizers(self):
         """Initialize optimizers, batch-wise and epoch-wise schedulers."""

@@ -517,7 +517,8 @@ def process_video(input_file, output_path, number_of_speakers=2,
                testset_only=False)
     
     # Load model
-    audiomodel = Dolphin.from_pretrained("JusperLee/Dolphin")
+    audiomodel = Dolphin.from_pretrained("JusperLee/Dolphin", 
+        cache_dir="/data/megastore/Projects/DuJing/code/Dolphin/ckpt")
     
     audiomodel.cuda()
     audiomodel.eval()

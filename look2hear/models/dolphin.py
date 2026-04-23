@@ -18,8 +18,9 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Optional
 from vector_quantize_pytorch import ResidualVQ
-from .video_compoent import * 
+from .video_compoent import *
 from huggingface_hub import PyTorchModelHubMixin
 
 from huggingface_hub import hf_hub_download
@@ -139,18 +140,19 @@ class DU_MHSA(torch.nn.Module):
                 torch.nn.Sigmoid())
         })
     
-    def forward(self, x: torch.Tensor, pos_k: torch.Tensor):
+    def forward(self, x: torch.Tensor, pos_k: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
         """
         Compute encoded features.
             :param torch.Tensor x: encoded source features (batch, max_time_in, size)
-            :param torch.Tensor mask: mask for x (batch, max_time_in)
+            :param torch.Tensor pos_k: positional encoding
+            :param torch.Tensor attn_mask: attention mask (batch, 1, time1, time2) or None
             :rtype: Tuple[torch.Tensor, torch.Tensor]
         """
         down_len = pos_k.shape[0]
         x_down = torch.nn.functional.adaptive_avg_pool1d(input=x, output_size=down_len)
         x = x.permute([0, 2, 1])
         x_down = x_down.permute([0, 2, 1])
-        x_down = self.block['self_attn'](x_down, pos_k, None)
+        x_down = self.block['self_attn'](x_down, pos_k, attn_mask)
         x_down = x_down.permute([0, 2, 1])
         x_downup = torch.nn.functional.upsample(input=x_down, size=x.shape[1])
         x_downup = x_downup.permute([0, 2, 1])
@@ -287,14 +289,14 @@ class GlobalBlock(torch.nn.Module):
             'FFN': FFN(in_channels=in_channels, dropout_rate=dropout_rate)
         })
     
-    def forward(self, x: torch.Tensor, pos_k: torch.Tensor):
+    def forward(self, x: torch.Tensor, pos_k: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
         """
         Compute encoded features.
             :param torch.Tensor x: encoded source features (batch, max_time_in, size)
-            :param torch.Tensor mask: mask for x (batch, max_time_in)
-            :rtype: Tuple[torch.Tensor, torch.Tensor]
+            :param torch.Tensor pos_k: positional encoding
+            :param torch.Tensor attn_mask: attention mask for DU_MHSA or None
         """
-        x = self.block['DU_MHSA'](x, pos_k)
+        x = self.block['DU_MHSA'](x, pos_k, attn_mask)
         x = self.block['FFN'](x)
         x = x.permute([0, 2, 1])
 
@@ -438,18 +440,25 @@ class AVFModule(nn.Module):
             norm_type="gLN"
         )
 
-    def forward(self, tensor_a: torch.Tensor, tensor_b: torch.Tensor):
+    def forward(self, tensor_a: torch.Tensor, tensor_b: torch.Tensor,
+                feat_mask: Optional[torch.Tensor] = None):
         """
         tensor_a: [B, Ca, T]
         tensor_b: [B, Cb, Tb]
+        feat_mask: [1, 1, T] or None — binary, 1=visible 0=masked
         """
         B, Ca, T = tensor_a.shape
         # 1) Use video to guide key_embed
         b2a = self.resize(tensor_b)               # [B, Ca, Tb]
         b2a = F.interpolate(b2a, size=T, mode="nearest")  # [B, Ca, T]
+        # Mask video features to visible window before fusion
+        if feat_mask is not None:
+            b2a = b2a * feat_mask
         k1 = self.key_embed(tensor_a) * b2a       # [B, Ca, T]
         # 2) audio value
         v = self.value_embed(tensor_a)            # [B, Ca, T]
+        if feat_mask is not None:
+            v = v * feat_mask
         # 3) Calculate attention scores
         att = self.attention_embed(tensor_b)      # [B, Ca*kernel, Tb]
         # reshape → [B, Ca, kernel, Tb]
@@ -457,9 +466,11 @@ class AVFModule(nn.Module):
         att = att.mean(dim=2)
         att = torch.softmax(att, dim=-1)          # [B, Ca, Tb]
         att = F.interpolate(att, size=T, mode="nearest")  # [B, Ca, T]
+        if feat_mask is not None:
+            att = att * feat_mask
         # 4) k2 = attention * value
-        k2 = att * v            
-        
+        k2 = att * v
+
         fused = k1 + k2                           # [B, Ca, T]
         return fused
 
@@ -716,20 +727,33 @@ class EncoderLayer(torch.nn.Module):
         
         self.downconv = DownConvLayer(**down_conv_layer) if down_conv == True else None
         
-    def forward(self, x: torch.Tensor, pos_k: torch.Tensor):
+    def forward(self, x: torch.Tensor, pos_k: torch.Tensor,
+                attn_mask: Optional[torch.Tensor] = None,
+                feat_mask: Optional[torch.Tensor] = None):
         '''
         x: [B, N, T]
+        attn_mask: [B, 1, T_attn, T_attn] or None
+        feat_mask: [1, 1, T] or None — binary, 1=visible 0=masked
         '''
-        x = self.g_block_1(x, pos_k)
+        if feat_mask is not None:
+            x = x * feat_mask
+
+        x = self.g_block_1(x, pos_k, attn_mask)
         x = x.permute(0, 2, 1).contiguous()
         x = self.l_block_1(x)
         x = x.permute(0, 2, 1).contiguous()
-        
-        x = self.g_block_2(x, pos_k)
+
+        if feat_mask is not None:
+            x = x * feat_mask
+
+        x = self.g_block_2(x, pos_k, attn_mask)
         x = x.permute(0, 2, 1).contiguous()
         x = self.l_block_2(x)
         x = x.permute(0, 2, 1).contiguous()
-        
+
+        if feat_mask is not None:
+            x = x * feat_mask
+
         skip = x
         if self.downconv:
             x = x.permute(0, 2, 1).contiguous()
@@ -751,28 +775,44 @@ class DecoderLayer(torch.nn.Module):
         self.g_block_3 = GlobalBlock(**global_blocks)
         self.l_block_3 = LocalBlock(**local_blocks)
     
-    def forward(self, x: torch.Tensor, pos_k: torch.Tensor):
+    def forward(self, x: torch.Tensor, pos_k: torch.Tensor,
+                attn_mask: Optional[torch.Tensor] = None,
+                feat_mask: Optional[torch.Tensor] = None):
         '''
         x: [B, N, T]
+        attn_mask: [B, 1, T_attn, T_attn] or None
+        feat_mask: [1, 1, T] or None — binary, 1=visible 0=masked
         '''
+        if feat_mask is not None:
+            x = x * feat_mask
+
         # [BS, K, H]
-        x = self.g_block_1(x, pos_k)
+        x = self.g_block_1(x, pos_k, attn_mask)
         x = x.permute(0, 2, 1).contiguous()
         x = self.l_block_1(x)
         x = x.permute(0, 2, 1).contiguous()
-        
-        x = self.g_block_2(x, pos_k)
+
+        if feat_mask is not None:
+            x = x * feat_mask
+
+        x = self.g_block_2(x, pos_k, attn_mask)
         x = x.permute(0, 2, 1).contiguous()
         x = self.l_block_2(x)
         x = x.permute(0, 2, 1).contiguous()
-        
-        x = self.g_block_3(x, pos_k)
+
+        if feat_mask is not None:
+            x = x * feat_mask
+
+        x = self.g_block_3(x, pos_k, attn_mask)
         x = x.permute(0, 2, 1).contiguous()
         x = self.l_block_3(x)
         x = x.permute(0, 2, 1).contiguous()
-        
+
+        if feat_mask is not None:
+            x = x * feat_mask
+
         skip = x
-        
+
         return x, skip
 
 class Separator(torch.nn.Module):
@@ -811,8 +851,13 @@ class Separator(torch.nn.Module):
             self.simple_fusion.append(InjectionMultiSum(simple_fusion['out_channels'], simple_fusion['out_channels'], kernel=5))
             self.dec_stages.append(DecoderLayer(**dec_stage))
     
-    def forward(self, input: torch.Tensor):
-        '''input: [B, N, L]'''
+    def forward(self, input: torch.Tensor,
+                attn_mask: Optional[torch.Tensor] = None,
+                feat_masks: Optional[list] = None):
+        '''input: [B, N, L]
+        attn_mask: [B, 1, T_attn, T_attn] bool or None
+        feat_masks: list of [1, 1, T_i] per stage, or None
+        '''
         # feature projection
         x, _ = self.pad_signal(input)
         len_x = x.shape[-1]
@@ -825,27 +870,40 @@ class Separator(torch.nn.Module):
         skip = []
         fusion_x = torch.zeros([x.shape[0], x.shape[1], min_len], requires_grad=True, device=x.device)
         for idx in range(self.num_stages):
-            x, skip_ = self.enc_stages[idx](x, pos_k)
+            enc_feat_mask = feat_masks[idx] if feat_masks is not None else None
+            x, skip_ = self.enc_stages[idx](x, pos_k, attn_mask, enc_feat_mask)
+            # Apply feat_mask to skip to prevent leakage through skip connections
+            if enc_feat_mask is not None:
+                skip_ = skip_ * enc_feat_mask
             skip.append(skip_)
             fusion_x = fusion_x + F.adaptive_avg_pool1d(x, min_len)
 
-        global_x = self.bottleneck_G[0](fusion_x.permute(0, 2, 1).contiguous(), None, None)
+        # Apply feat_mask at bottleneck resolution
+        if feat_masks is not None:
+            # bottleneck_feat_mask at min_len resolution (= stage num_stages-1 after pooling)
+            bn_mask = feat_masks[-1]
+            if bn_mask.shape[-1] != min_len:
+                bn_mask = F.interpolate(bn_mask.float(), size=min_len, mode='nearest')
+            fusion_x = fusion_x * bn_mask
+
+        global_x = self.bottleneck_G[0](fusion_x.permute(0, 2, 1).contiguous(), None, attn_mask)
         global_x = self.bottleneck_G[1](global_x).permute(0, 2, 1).contiguous()
-        
+
         # Global topdown attention
         fusion_skip = []
         for idx in range(self.num_stages):
             fusion_skip.append(self.loc_glo_fus[idx](skip[idx], global_x))
-        
+
         each_stage_outputs = []
         # Temporal Expanding Part
         for idx in range(self.num_stages):
             each_stage_outputs.append(x)
             idx_en = self.num_stages - (idx + 1)
             x = self.simple_fusion[idx](fusion_skip[idx_en], x)
-            x, _ = self.dec_stages[idx](x, pos_k)
-        
-        last_stage_output = x 
+            dec_feat_mask = feat_masks[idx_en] if feat_masks is not None else None
+            x, _ = self.dec_stages[idx](x, pos_k, attn_mask, dec_feat_mask)
+
+        last_stage_output = x
         return last_stage_output, each_stage_outputs
     
     def pad_signal(self, input: torch.Tensor):
@@ -1302,7 +1360,8 @@ class Dolphin(nn.Module, PyTorchModelHubMixin):
         self.pre_v1 = ConvNormAct(vpre_channels, vin_channels, kSize=3, norm_type="BN")
 
         self.num_stages = num_stages
-        self.audio_encoder = AudioEncoder(**module_audio_enc) 
+        self.audio_encoder_stride = module_audio_enc.get("stride", 4)
+        self.audio_encoder = AudioEncoder(**module_audio_enc)
         self.feature_projector = FeatureProjector(**module_feature_projector)
         self.separator = Separator(**module_separator)
         self.out_layer = OutputLayer(**module_output_layer)
@@ -1552,19 +1611,49 @@ class Dolphin(nn.Module, PyTorchModelHubMixin):
         
         return model
         
-    def forward(self, input, mouth):
+    def forward(self, input, mouth,
+                chunk_size: Optional[int] = None,
+                history_len: Optional[int] = None,
+                future_len: Optional[int] = None):
+        """Forward pass with optional streaming chunk masking.
+
+        Args:
+            input: audio waveform [B, T]
+            mouth: video mouth ROI [B, T, H, W]
+            chunk_size: chunk size in waveform samples (for streaming), or None
+            history_len: history context in waveform samples, or None
+            future_len: future lookahead in waveform samples, or None
+        """
         mouth = self.video_encoder(mouth).permute(0, 2, 1).contiguous()
         v=self.pre_v1(mouth)
         v=self.video_blocks(v)
 
         encoder_output = self.audio_encoder(input)
         projected_feature = self.feature_projector(encoder_output)
-        
-        projected_feature = self.modalfuse(projected_feature,v)
 
-        last_stage_output, each_stage_outputs = self.separator(projected_feature)
-    
+        # Generate chunk masks if streaming params provided
+        feat_mask = None
+        attn_mask = None
+        feat_masks = None
+        if chunk_size is not None and history_len is not None and future_len is not None:
+            from ..utils.chunk_mask import ChunkMaskConfig, generate_chunk_masks
+            config = ChunkMaskConfig(
+                chunk_size=chunk_size,
+                history_len=history_len,
+                future_len=future_len,
+                audio_encoder_stride=self.audio_encoder_stride,
+                num_separator_stages=self.separator.num_stages,
+            )
+            T_feat = projected_feature.shape[-1]
+            feat_mask, attn_mask, feat_masks = generate_chunk_masks(T_feat, projected_feature.device, config)
+            # Apply feat_mask to projected features before fusion
+            projected_feature = projected_feature * feat_mask
+
+        projected_feature = self.modalfuse(projected_feature, v, feat_mask)
+
+        last_stage_output, each_stage_outputs = self.separator(projected_feature, attn_mask, feat_masks)
+
         out_layer_output = self.out_layer(last_stage_output, encoder_output)
         audio=self.audio_decoder(out_layer_output)
-        
+
         return audio.unsqueeze(dim=1)

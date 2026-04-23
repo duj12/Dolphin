@@ -176,6 +176,23 @@ datamodule:
 exp:
   exp_name: LRS2-final-Dolphin-1gpu-batch4
 
+# Streaming/chunk-aware training config
+streaming:
+  enabled: true
+  # All lengths in samples at waveform level (16kHz)
+  chunk_size_range: [3200, 8000]      # 200ms to 500ms
+  history_len_range: [1600, 6400]      # 100ms to 400ms history context
+  future_len_range: [0, 3200]          # 0ms to 200ms future lookahead
+  # Inference defaults (fixed chunk params for streaming inference)
+  inference_chunk_size: 6400           # 400ms
+  inference_history_len: 3200          # 200ms
+  inference_future_len: 1600           # 100ms
+  # Gradual unmasking schedule (optional)
+  schedule:
+    enabled: false
+    warmup_epochs: 10    # first N epochs: no masking (full context)
+    ramp_epochs: 20      # gradually increase masking probability
+
 logging:
   use_swanlab: true
   swanlab:

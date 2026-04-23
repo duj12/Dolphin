@@ -12,8 +12,8 @@ spaces
 tf-keras
 retina-face
 safetensors
-python-speech-features==0.6
-scipy==1.10.0
-opencv-python==4.5.4.60
-sentencepiece==0.1.96
-editdistance==0.6.0
+scipy
+python-speech-features
+opencv-python
+sentencepiece
+editdistance
